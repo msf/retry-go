@@ -2,14 +2,14 @@ package retry_test
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/avast/retry-go/v4"
+	"github.com/avast/retry-go/v5"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -35,18 +35,28 @@ func TestCustomRetryFunction(t *testing.T) {
 			// HTTP 429 status code with Retry-After header in seconds
 			w.Header().Add("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
-			w.Write([]byte("Server limit reached"))
+			_, _ = w.Write([]byte("Server limit reached"))
 			attempts--
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("hello"))
+		_, _ = w.Write([]byte("hello"))
 	}))
 	defer ts.Close()
 
 	var body []byte
 
-	err := retry.Do(
+	err := retry.New(
+		retry.DelayType(func(n uint, err error, config retry.DelayContext) time.Duration {
+			fmt.Println("Server fails with: " + err.Error())
+			if retriable, ok := err.(*RetriableError); ok {
+				fmt.Printf("Client follows server recommendation to retry after %v\n", retriable.RetryAfter)
+				return retriable.RetryAfter
+			}
+			// apply a default exponential back off strategy
+			return retry.BackOffDelay(n, err, config)
+		}),
+	).Do(
 		func() error {
 			resp, err := http.Get(ts.URL)
 
@@ -56,7 +66,7 @@ func TestCustomRetryFunction(t *testing.T) {
 						panic(err)
 					}
 				}()
-				body, err = ioutil.ReadAll(resp.Body)
+				body, err = io.ReadAll(resp.Body)
 				if resp.StatusCode != 200 {
 					err = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 					if resp.StatusCode == http.StatusTooManyRequests {
@@ -79,15 +89,6 @@ func TestCustomRetryFunction(t *testing.T) {
 
 			return err
 		},
-		retry.DelayType(func(n uint, err error, config *retry.Config) time.Duration {
-			fmt.Println("Server fails with: " + err.Error())
-			if retriable, ok := err.(*RetriableError); ok {
-				fmt.Printf("Client follows server recommendation to retry after %v\n", retriable.RetryAfter)
-				return retriable.RetryAfter
-			}
-			// apply a default exponential back off strategy
-			return retry.BackOffDelay(n, err, config)
-		}),
 	)
 
 	fmt.Println("Server responds with: " + string(body))

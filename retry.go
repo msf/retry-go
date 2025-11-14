@@ -10,7 +10,10 @@ HTTP GET with retry:
 	url := "http://example.com"
 	var body []byte
 
-	err := retry.Do(
+	err := retry.New(
+		retry.Attempts(5),
+		retry.Delay(100*time.Millisecond),
+	).Do(
 		func() error {
 			resp, err := http.Get(url)
 			if err != nil {
@@ -35,7 +38,7 @@ HTTP GET with retry with data:
 
 	url := "http://example.com"
 
-	body, err := retry.DoWithData(
+	body, err := retry.DoWithData(retry.New(),
 		func() ([]byte, error) {
 			resp, err := http.Get(url)
 			if err != nil {
@@ -57,21 +60,20 @@ HTTP GET with retry with data:
 
 	fmt.Println(string(body))
 
-Zero-allocation retry with reusable config (for high-frequency/hot-path usage):
+Reusable retrier for high-frequency retry operations:
 
-	// Create config once, reuse many times
-	config := retry.NewConfig(
+	// Create retrier once, reuse many times
+	retrier := retry.New(
 		retry.Attempts(5),
 		retry.Delay(100*time.Millisecond),
 	)
 
-	// Zero allocations in happy path (no retries needed)
+	// Minimal allocations in happy path
 	for {
-		err := retry.DoWithConfig(
+		err := retrier.Do(
 			func() error {
 				return doWork()
 			},
-			config,
 		)
 		if err != nil {
 			// handle error
@@ -93,6 +95,15 @@ Zero-allocation retry with reusable config (for high-frequency/hot-path usage):
 * [matryer/try](https://github.com/matryer/try) - very popular package, nonintuitive interface (for me)
 
 # BREAKING CHANGES
+
+* 5.0.0
+  - Complete API redesign: method-based retry operations
+  - Renamed `Config` type to `Retrier`
+  - Renamed `NewConfig()` to `New()`
+  - Changed from package-level functions to methods: `retry.Do(func, config)` → `retry.New(opts...).Do(func)`
+  - `DelayTypeFunc` signature changed: `func(n uint, err error, config *Config)` → `func(n uint, err error, r *Retrier)`
+  - Migration: `retry.Do(func, opts...)` → `retry.New(opts...).Do(func)` (simple find & replace)
+  - This change improves performance, simplifies the API, and provides a cleaner interface
 
 * 4.0.0
   - infinity retry is possible by set `Attempts(0)` by PR [#49](https://github.com/avast/retry-go/pull/49)
@@ -125,60 +136,39 @@ type RetryableFunc func() error
 // Function signature of retryable function with data
 type RetryableFuncWithData[T any] func() (T, error)
 
-// Default timer is a wrapper around time.After
+// Default r.timer is a wrapper around time.After
 type timerImpl struct{}
 
 func (t *timerImpl) After(d time.Duration) <-chan time.Time {
 	return time.After(d)
 }
 
-func Do(retryableFunc RetryableFunc, opts ...Option) error {
+// Do executes the retryable function using this Retrier's configuration.
+func (r *Retrier) Do(retryableFunc RetryableFunc) error {
 	retryableFuncWithData := func() (any, error) {
 		return nil, retryableFunc()
 	}
 
-	_, err := DoWithData(retryableFuncWithData, opts...)
+	_, err := doWithData(r.retrierCore, retryableFuncWithData)
 	return err
 }
 
-// DoWithConfig executes retryableFunc using a pre-built Config created via NewConfig().
-// This eliminates per-call allocations by reusing the Config across multiple retry operations.
-// The Config must not be modified after creation.
-func DoWithConfig(retryableFunc RetryableFunc, config *Config) error {
-	retryableFuncWithData := func() (any, error) {
-		return nil, retryableFunc()
-	}
-
-	_, err := DoWithDataAndConfig(retryableFuncWithData, config)
-	return err
+// Do executes the retryable function using this RetrierWithData's configuration.
+func (r *RetrierWithData[T]) Do(retryableFunc RetryableFuncWithData[T]) (T, error) {
+	return doWithData(r.retrierCore, retryableFunc)
 }
 
-func DoWithData[T any](retryableFunc RetryableFuncWithData[T], opts ...Option) (T, error) {
-	// default
-	config := newDefaultRetryConfig()
-
-	// apply opts
-	for _, opt := range opts {
-		opt(config)
-	}
-
-	return DoWithDataAndConfig(retryableFunc, config)
-}
-
-// DoWithDataAndConfig executes retryableFunc using a pre-built Config created via NewConfig().
-// This eliminates per-call allocations by reusing the Config across multiple retry operations.
-// The Config must not be modified after creation.
-func DoWithDataAndConfig[T any](retryableFunc RetryableFuncWithData[T], config *Config) (T, error) {
-	var n uint
+func doWithData[T any](r *retrierCore, retryableFunc RetryableFuncWithData[T]) (T, error) {
 	var emptyT T
+	var n uint
 
-	if err := context.Cause(config.context); err != nil {
+	if err := context.Cause(r.context); err != nil {
 		return emptyT, err
 	}
 
-	// Setting attempts to 0 means we'll retry until we succeed
+	// Setting r.attempts to 0 means we'll retry until we succeed
 	var lastErr error
-	if config.attempts == 0 {
+	if r.attempts == 0 {
 		for {
 			t, err := retryableFunc()
 			if err == nil {
@@ -189,30 +179,30 @@ func DoWithDataAndConfig[T any](retryableFunc RetryableFuncWithData[T], config *
 				return emptyT, err
 			}
 
-			if !config.retryIf(err) {
+			if !r.retryIf(err) {
 				return emptyT, err
 			}
 
 			lastErr = err
 
-			config.onRetry(n, err)
+			r.onRetry(n, err)
 			n++
 			select {
-			case <-config.timer.After(delay(config, n, err)):
-			case <-config.context.Done():
-				if config.wrapContextErrorWithLastError {
-					return emptyT, Error{context.Cause(config.context), lastErr}
+			case <-r.timer.After(r.computeDelay(n, err)):
+			case <-r.context.Done():
+				if r.wrapContextErrorWithLastError {
+					return emptyT, Error{context.Cause(r.context), lastErr}
 				}
-				return emptyT, context.Cause(config.context)
+				return emptyT, context.Cause(r.context)
 			}
 		}
 	}
 
 	errorLog := Error{}
 
-	attemptsForError := make(map[error]uint, len(config.attemptsForError))
-	for err, attempts := range config.attemptsForError {
-		attemptsForError[err] = attempts
+	attemptsForErrorCopy := make(map[error]uint, len(r.attemptsForError))
+	for err, attempts := range r.attemptsForError {
+		attemptsForErrorCopy[err] = attempts
 	}
 
 	shouldRetry := true
@@ -224,47 +214,44 @@ func DoWithDataAndConfig[T any](retryableFunc RetryableFuncWithData[T], config *
 
 		errorLog = append(errorLog, unpackUnrecoverable(err))
 
-		if !config.retryIf(err) {
+		if !r.retryIf(err) {
 			break
 		}
 
-		config.onRetry(n, err)
+		r.onRetry(n, err)
 
-		for errToCheck, attempts := range attemptsForError {
+		for errToCheck, attemptsForThisError := range attemptsForErrorCopy {
 			if errors.Is(err, errToCheck) {
-				attempts--
-				attemptsForError[errToCheck] = attempts
-				shouldRetry = shouldRetry && attempts > 0
+				attemptsForThisError--
+				attemptsForErrorCopy[errToCheck] = attemptsForThisError
+				shouldRetry = shouldRetry && attemptsForThisError > 0
 			}
 		}
 
 		// if this is last attempt - don't wait
-		if n == config.attempts-1 {
+		if n == r.attempts-1 {
 			break
 		}
 		n++
 		select {
-		case <-config.timer.After(delay(config, n, err)):
-		case <-config.context.Done():
-			if config.lastErrorOnly {
-				return emptyT, context.Cause(config.context)
+		case <-r.timer.After(r.computeDelay(n, err)):
+		case <-r.context.Done():
+			if r.lastErrorOnly {
+				return emptyT, context.Cause(r.context)
 			}
 
-			return emptyT, append(errorLog, context.Cause(config.context))
+			return emptyT, append(errorLog, context.Cause(r.context))
 		}
 
-		shouldRetry = shouldRetry && n < config.attempts
+		shouldRetry = shouldRetry && n < r.attempts
 	}
 
-	if config.lastErrorOnly {
+	if r.lastErrorOnly {
 		return emptyT, errorLog.Unwrap()
 	}
 	return emptyT, errorLog
 }
 
-func newDefaultRetryConfig() *Config {
-	return NewConfig()
-}
 
 // Error type represents list of errors in retry
 type Error []error
@@ -366,11 +353,10 @@ func unpackUnrecoverable(err error) error {
 	return err
 }
 
-func delay(config *Config, n uint, err error) time.Duration {
-	delayTime := config.delayType(n, err, config)
-	if config.maxDelay > 0 && delayTime > config.maxDelay {
-		delayTime = config.maxDelay
+func (r *retrierCore) computeDelay(n uint, err error) time.Duration {
+	delayTime := r.delayType(n, err, r)
+	if r.maxDelay > 0 && delayTime > r.maxDelay {
+		delayTime = r.maxDelay
 	}
-
 	return delayTime
 }

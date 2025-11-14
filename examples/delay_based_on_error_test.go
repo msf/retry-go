@@ -4,13 +4,13 @@ package retry_test
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/avast/retry-go/v4"
+	"github.com/avast/retry-go/v5"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -38,28 +38,14 @@ func (err SomeOtherError) Error() string {
 
 func TestCustomRetryFunctionBasedOnKindOfError(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "hello")
+		_, _ = fmt.Fprintln(w, "hello")
 	}))
 	defer ts.Close()
 
 	var body []byte
 
-	err := retry.Do(
-		func() error {
-			resp, err := http.Get(ts.URL)
-
-			if err == nil {
-				defer func() {
-					if err := resp.Body.Close(); err != nil {
-						panic(err)
-					}
-				}()
-				body, err = ioutil.ReadAll(resp.Body)
-			}
-
-			return err
-		},
-		retry.DelayType(func(n uint, err error, config *retry.Config) time.Duration {
+	err := retry.New(
+		retry.DelayType(func(n uint, err error, config retry.DelayContext) time.Duration {
 			switch e := err.(type) {
 			case RetryAfterError:
 				if t, err := parseRetryAfter(e.response.Header.Get("Retry-After")); err == nil {
@@ -72,6 +58,21 @@ func TestCustomRetryFunctionBasedOnKindOfError(t *testing.T) {
 			//default is backoffdelay
 			return retry.BackOffDelay(n, err, config)
 		}),
+	).Do(
+		func() error {
+			resp, err := http.Get(ts.URL)
+
+			if err == nil {
+				defer func() {
+					if err := resp.Body.Close(); err != nil {
+						panic(err)
+					}
+				}()
+				body, err = io.ReadAll(resp.Body)
+			}
+
+			return err
+		},
 	)
 
 	assert.NoError(t, err)
